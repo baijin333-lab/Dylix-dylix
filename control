@@ -1,0 +1,8 @@
+Package: com.dylix.staylowpowermode
+Name: StayLowPowerMode
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Maintainer: Dylix
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 15.0)
+Description: 充电到 80% 时不再自动关闭低电量模式（iOS 15+，Dopamine rootless）
