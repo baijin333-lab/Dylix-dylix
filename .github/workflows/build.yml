@@ -39,14 +39,17 @@ jobs:
       - name: Build rootless deb (arm64 + arm64e)
         run: |
           set -x
+          set -o pipefail
           export THEOS_PACKAGE_SCHEME=rootless
           make package FINALPACKAGE=1 2>&1 | tee /tmp/build.log
 
-      - name: Show build log tail on failure
-        if: failure()
+      - name: Show build log and packages dir
+        if: always()
         run: |
-          echo "=== last 120 lines ==="
-          tail -120 /tmp/build.log || true
+          echo "=== packages dir ==="
+          ls -la packages || echo "no packages directory"
+          echo "=== last 200 lines of build log ==="
+          tail -200 /tmp/build.log || true
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
