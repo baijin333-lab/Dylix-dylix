@@ -26,6 +26,13 @@ jobs:
           ls "$THEOS/sdks"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
+      - name: Install ldid
+        run: |
+          set -euo pipefail
+          brew install ldid
+          command -v ldid
+          ldid -v || ldid --version || true
+
       - name: Toolchain diagnostics
         run: |
           echo "THEOS=$THEOS"
