@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <stdlib.h>
 #import <string.h>
 
@@ -39,28 +40,45 @@ static double SLPMNumber(NSString *key, double fallback) {
 static BOOL gRestoredThisCharge = NO;   // 本次充电周期内已兜底恢复过一次
 static BOOL gLastKnownLowPower = NO;
 
-static volatile BOOL gCacheValid = NO;
 static volatile BOOL gCachedCharging = NO;
 static volatile float gCachedLevel = -1.0f;
 
-// 只在主线程/构造期真正读取 UIDevice，其余路径读缓存，避免后台线程触碰 UIKit
-static void SLPMRefreshBatteryCache(void) {
+// 直接实时读电池：SpringBoard 里 UIDevice 的电池通知不一定触发，
+// 依赖缓存会让判定永远停在初始值（charging=NO），插件就等于没装。
+static void SLPMReadBattery(BOOL *charging, float *level) {
     UIDevice *device = [UIDevice currentDevice];
     if (!device.isBatteryMonitoringEnabled) {
         device.batteryMonitoringEnabled = YES;
     }
     UIDeviceBatteryState state = device.batteryState;
-    gCachedCharging = (state == UIDeviceBatteryStateCharging || state == UIDeviceBatteryStateFull);
-    gCachedLevel = device.batteryLevel;
-    gCacheValid = YES;
+    *charging = (state == UIDeviceBatteryStateCharging || state == UIDeviceBatteryStateFull);
+    *level = device.batteryLevel;
+    gCachedCharging = *charging;
+    gCachedLevel = *level;
 }
 
-static void SLPMReadBattery(BOOL *charging, float *level) {
-    if (!gCacheValid) {
-        SLPMRefreshBatteryCache();
-    }
-    *charging = gCachedCharging;
-    *level = gCachedLevel;
+// 兼容旧调用点：构造期与电池通知里刷新一次
+static void SLPMRefreshBatteryCache(void) {
+    BOOL charging = NO;
+    float level = -1.0f;
+    SLPMReadBattery(&charging, &level);
+}
+
+// 自检：把运行状态写进偏好域，可用 Filza 打开
+// /var/mobile/Library/Preferences/com.dylix.staylowpowermode.plist
+// 关注键：Loaded / HasSetter / LastEvent / LastCharging / LastLevel / LastProcess
+static void SLPMRecordState(NSString *event) {
+    BOOL charging = NO;
+    float level = -1.0f;
+    SLPMReadBattery(&charging, &level);
+    NSUserDefaults *defaults = SLPMDefaults();
+    [defaults setBool:YES forKey:@"Loaded"];
+    [defaults setObject:event forKey:@"LastEvent"];
+    [defaults setObject:[NSDate date] forKey:@"LastEventDate"];
+    [defaults setBool:charging forKey:@"LastCharging"];
+    [defaults setFloat:level forKey:@"LastLevel"];
+    [defaults setBool:[NSProcessInfo processInfo].isLowPowerModeEnabled forKey:@"LastLowPower"];
+    [defaults synchronize];
 }
 
 // 开关开启 + 正在充电 + 电量达到阈值（电量未知时按“已满足”处理）
@@ -89,15 +107,25 @@ static BOOL SLPMShouldBlockDisable(void) {
 
 static BOOL SLPMForceEnable(void) {
     NSProcessInfo *info = [NSProcessInfo processInfo];
-    if (![info respondsToSelector:NSSelectorFromString(@"_setLowPowerModeEnabled:")]) return NO;
-    [info _setLowPowerModeEnabled:YES];
-    return YES;
+    if ([info respondsToSelector:NSSelectorFromString(@"_setLowPowerModeEnabled:")]) {
+        [info _setLowPowerModeEnabled:YES];
+        if (info.isLowPowerModeEnabled) return YES;
+    }
+    // 备用路径：PowerUI 的 PMLowPowerMode（1 = 低电量模式）
+    Class powerModeClass = objc_getClass("PMLowPowerMode");
+    SEL setter = NSSelectorFromString(@"setPowerMode:fromSource:");
+    if (powerModeClass && [powerModeClass respondsToSelector:setter]) {
+        ((void (*)(id, SEL, int, id))objc_msgSend)(powerModeClass, setter, 1, @"StayLowPowerMode");
+        return YES;
+    }
+    return NO;
 }
 
 static void SLPMHandleLowPowerStateChange(void) {
     BOOL enabled = [NSProcessInfo processInfo].isLowPowerModeEnabled;
     BOOL wasEnabled = gLastKnownLowPower;
     gLastKnownLowPower = enabled;
+    SLPMRecordState(enabled ? @"state-change-on" : @"state-change-off");
 
     if (enabled) {
         gRestoredThisCharge = NO;   // 手动重新开启：恢复兜底能力
@@ -124,8 +152,10 @@ static void SLPMHandleLowPowerStateChange(void) {
 
     if (SLPMForceEnable()) {
         gRestoredThisCharge = YES;
+        SLPMRecordState(@"restored");
         SLPM_LOG(@"低电量模式已被系统关闭，已兜底重新开启（电量 %.0f%%）", level * 100.0f);
     } else {
+        SLPMRecordState(@"restore-failed");
         SLPM_LOG(@"兜底失败：当前进程没有 _setLowPowerModeEnabled:");
     }
 }
@@ -178,6 +208,38 @@ static void SLPMInstallObservers(void) {
                     usingBlock:batteryBlock];
 }
 
+// 看门狗：即使 hook 与电池通知都没命中，也每 15 秒检查一次
+static void SLPMWatchdogTick(void) {
+    NSProcessInfo *info = [NSProcessInfo processInfo];
+    BOOL enabled = info.isLowPowerModeEnabled;
+    gLastKnownLowPower = enabled;
+    if (enabled) {
+        gRestoredThisCharge = NO;
+        return;
+    }
+    if (!SLPMChargingAtOrAboveThreshold()) return;
+    if (gRestoredThisCharge) return;
+
+    BOOL charging = NO;
+    float level = -1.0f;
+    SLPMReadBattery(&charging, &level);
+    if (SLPMForceEnable()) {
+        gRestoredThisCharge = YES;
+        SLPMRecordState(@"watchdog-restored");
+        SLPM_LOG(@"看门狗：低电量模式被关闭，已重新开启（电量 %.0f%%）", level * 100.0f);
+    } else {
+        SLPMRecordState(@"watchdog-failed");
+    }
+}
+
+static void SLPMStartWatchdog(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSTimer scheduledTimerWithTimeInterval:15.0 repeats:YES block:^(NSTimer *timer) {
+            SLPMWatchdogTick();
+        }];
+    });
+}
+
 %group SLPMPrivate
 
 %hook NSProcessInfo
@@ -193,6 +255,7 @@ static void SLPMInstallObservers(void) {
         BOOL charging = NO;
         float level = -1.0f;
         SLPMReadBattery(&charging, &level);
+        SLPMRecordState(@"blocked");
         SLPM_LOG(@"已拦截低电量模式自动关闭（充电中，电量 %.0f%%）", level * 100.0f);
         return;
     }
@@ -228,7 +291,13 @@ static void SLPMInstallObservers(void) {
             SLPM_LOG(@"未找到 _setLowPowerModeEnabled:，仅启用兜底恢复");
         }
 
+        [SLPMDefaults() setBool:YES forKey:@"Loaded"];
+        [SLPMDefaults() setBool:hasPrivateSetter forKey:@"HasSetter"];
+        [SLPMDefaults() setObject:[[NSProcessInfo processInfo] processName] forKey:@"LastProcess"];
+        [SLPMDefaults() synchronize];
+
         SLPMInstallObservers();
+        SLPMStartWatchdog();
 
         if (SLPMFlag(@"LogVerbose", NO)) {
             SLPMDumpCandidates();
